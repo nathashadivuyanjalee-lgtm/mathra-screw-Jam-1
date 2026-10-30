@@ -1,0 +1,690 @@
+import 'dart:math';
+import 'package:flame/events.dart';
+import 'package:flame/game.dart';
+import 'package:flutter/material.dart';
+import '../models/game_models.dart';
+import '../providers/game_provider.dart';
+import '../services/audio_service.dart';
+
+class FlyingScrew {
+  final String holeId;
+  final ScrewColor screw;
+  final ScrewSlotType slotType;
+  final Offset startPos;
+  final Offset targetPos;
+  final bool toActiveBox;
+  final int targetSlot;
+  double progress = 0.0;
+  final double duration;
+  final VoidCallback onComplete;
+
+  FlyingScrew({
+    required this.holeId,
+    required this.screw,
+    required this.slotType,
+    required this.startPos,
+    required this.targetPos,
+    required this.toActiveBox,
+    required this.targetSlot,
+    required this.onComplete,
+    this.duration = 0.26,
+  });
+}
+
+class _BoxSlotTracker {
+  final ScrewColor targetColor;
+  final int capacity;
+  int count;
+
+  _BoxSlotTracker({
+    required this.targetColor,
+    required this.capacity,
+    required this.count,
+  });
+}
+
+class ScrewJamGame extends FlameGame with TapCallbacks {
+  final GameNotifier notifier;
+  GameState currentState;
+  final List<FlyingScrew> _flyingScrews = [];
+  final Set<String> _animatingHoleIds = {};
+
+  ScrewJamGame({
+    required this.notifier,
+    required this.currentState,
+  });
+
+  static const double virtualWidth = 360.0;
+  static const double virtualHeight = 500.0;
+  static const double horizontalPadding = 20.0;
+  static const double verticalPadding = 12.0;
+
+  double userZoom = 1.0;
+  Offset userPan = Offset.zero;
+
+  double get boardScale {
+    final availableW = max(100.0, size.x - horizontalPadding * 2);
+    final availableH = max(100.0, size.y - verticalPadding * 2);
+    final baseScale = min(availableW / virtualWidth, availableH / virtualHeight).clamp(0.5, 1.35);
+    return baseScale * userZoom;
+  }
+
+  double get boardOriginX => ((size.x - (virtualWidth * boardScale)) / 2.0) + userPan.dx;
+  double get boardOriginY => ((size.y - (virtualHeight * boardScale)) / 2.0) + userPan.dy;
+
+  Offset screenToBoard(Offset screenPos) {
+    return Offset(
+      (screenPos.dx - boardOriginX) / boardScale,
+      (screenPos.dy - boardOriginY) / boardScale,
+    );
+  }
+
+  void setZoomAndPan(double zoom, Offset pan) {
+    userZoom = zoom.clamp(0.65, 3.0);
+    userPan = pan;
+  }
+
+  void resetZoomAndPan() {
+    userZoom = 1.0;
+    userPan = Offset.zero;
+  }
+
+  void updateState(GameState newState) {
+    if (newState.level != currentState.level || newState.status != currentState.status) {
+      _flyingScrews.clear();
+      _animatingHoleIds.clear();
+    }
+    currentState = newState;
+  }
+
+  @override
+  Color backgroundColor() => Colors.transparent;
+
+  @override
+  void update(double dt) {
+    super.update(dt);
+
+    final completed = <FlyingScrew>[];
+    for (final fs in _flyingScrews) {
+      fs.progress += dt / fs.duration;
+      if (fs.progress >= 1.0) {
+        completed.add(fs);
+      }
+    }
+
+    for (final fs in completed) {
+      _flyingScrews.remove(fs);
+      _animatingHoleIds.remove(fs.holeId);
+      fs.onComplete();
+    }
+
+    for (final plate in currentState.plates) {
+      final remainingHoles = plate.holes.where((h) => h.currentScrew != null).toList();
+
+      if (plate.hadScrewsOnLoad && remainingHoles.isEmpty) {
+        if (!plate.isFalling) {
+          plate.isFalling = true;
+          AudioService.I.sfx(Sfx.fall);
+          plate.fallSpeedY = 140.0;
+          plate.fallSpeedX = (Random().nextDouble() - 0.5) * 100.0;
+          plate.angularVelocity = (Random().nextDouble() - 0.5) * 5.0;
+          plate.pivotWorld = null;
+        }
+
+        plate.fallSpeedY += 1500.0 * dt;
+        plate.position += Offset(plate.fallSpeedX * dt, plate.fallSpeedY * dt);
+        plate.angle += plate.angularVelocity * dt;
+
+        if (plate.position.dy > 650.0) {
+          plate.opacity = max(0.0, plate.opacity - dt * 1.8);
+        }
+      } else if (remainingHoles.length == 1) {
+        final pinHole = remainingHoles.first;
+        final rLocal = pinHole.relativeOffset;
+
+        if (plate.pivotWorld == null) {
+          final cosA = cos(plate.angle);
+          final sinA = sin(plate.angle);
+          final rx = rLocal.dx * cosA - rLocal.dy * sinA;
+          final ry = rLocal.dx * sinA + rLocal.dy * cosA;
+          plate.pivotWorld = plate.position + Offset(rx, ry);
+        }
+
+        final pivot = plate.pivotWorld!;
+        final armDist = rLocal.distance;
+
+        if (armDist > 1.5) {
+          final cosA = cos(plate.angle);
+          final sinA = sin(plate.angle);
+          final cmVecX = -(rLocal.dx * cosA - rLocal.dy * sinA);
+
+          const double g = 1450.0;
+          final double torque = cmVecX * g;
+          final double momentOfInertia = plate.mass * (armDist * armDist + 1600.0);
+          final double angularAccel = torque / momentOfInertia;
+
+          plate.angularVelocity += angularAccel * dt;
+          plate.angularVelocity *= pow(0.965, dt * 60);
+          plate.angle += plate.angularVelocity * dt;
+
+          final newCosA = cos(plate.angle);
+          final newSinA = sin(plate.angle);
+          final newRx = rLocal.dx * newCosA - rLocal.dy * newSinA;
+          final newRy = rLocal.dx * newSinA + rLocal.dy * newCosA;
+          plate.position = pivot - Offset(newRx, newRy);
+        }
+      } else {
+        plate.pivotWorld = null;
+        plate.angularVelocity = 0.0;
+      }
+    }
+  }
+
+  @override
+  void render(Canvas canvas) {
+    super.render(canvas);
+
+    canvas.save();
+    canvas.translate(boardOriginX, boardOriginY);
+    canvas.scale(boardScale, boardScale);
+
+    final sortedPlates = List<PlateModel>.from(currentState.plates)
+      ..sort((a, b) => a.layer.compareTo(b.layer));
+
+    for (final plate in sortedPlates) {
+      if (plate.opacity > 0.01) {
+        _renderPlate(canvas, plate);
+      }
+    }
+
+    for (final fs in _flyingScrews) {
+      _renderFlyingScrew(canvas, fs);
+    }
+
+    canvas.restore();
+  }
+
+  void _renderFlyingScrew(Canvas canvas, FlyingScrew fs) {
+    final t = Curves.easeOutCubic.transform(fs.progress.clamp(0.0, 1.0));
+    final basePos = Offset.lerp(fs.startPos, fs.targetPos, t)!;
+    final arcHeight = -45.0 * sin(fs.progress.clamp(0.0, 1.0) * pi);
+    final pos = basePos + Offset(0, arcHeight);
+    final scale = 1.0 + 0.35 * sin(fs.progress.clamp(0.0, 1.0) * pi);
+    final angle = fs.progress * 4.0 * pi;
+
+    canvas.save();
+    canvas.translate(pos.dx, pos.dy);
+    canvas.scale(scale, scale);
+    canvas.rotate(angle);
+
+    final screwShadowPaint = Paint()
+      ..color = fs.screw.shadow.withValues(alpha: 0.5)
+      ..maskFilter = MaskFilter.blur(BlurStyle.normal, 8.0 + scale * 4.0);
+    canvas.drawCircle(const Offset(0, 5), 18, screwShadowPaint);
+
+    final screwBodyPaint = Paint()
+      ..shader = RadialGradient(
+        center: const Alignment(-0.35, -0.4),
+        radius: 0.85,
+        colors: [
+          fs.screw.highlight,
+          fs.screw.primary,
+          fs.screw.dark,
+        ],
+        stops: const [0.0, 0.55, 1.0],
+      ).createShader(Rect.fromCircle(center: Offset.zero, radius: 16));
+
+    if (AudioService.I.threeD) {
+      canvas.drawCircle(const Offset(0, 4), 16, Paint()..color = fs.screw.dark);
+    }
+    canvas.drawCircle(Offset.zero, 16, screwBodyPaint);
+    if (AudioService.I.threeD) {
+      canvas.drawCircle(
+        const Offset(-5, -6),
+        3.8,
+        Paint()
+          ..color = Colors.white.withValues(alpha: 0.8)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 1.6),
+      );
+    }
+
+    final borderScrew = Paint()
+      ..color = Colors.white.withValues(alpha: 0.8)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5;
+    canvas.drawCircle(Offset.zero, 16, borderScrew);
+
+    if (fs.slotType == ScrewSlotType.star) {
+      _renderStarScrewSlot(canvas, Offset.zero, fs.screw.dark);
+    } else {
+      _renderCrossScrewSlot(canvas, Offset.zero, fs.screw.dark);
+    }
+
+    canvas.restore();
+  }
+
+  void _renderPlate(Canvas canvas, PlateModel plate) {
+    canvas.save();
+    canvas.translate(plate.position.dx, plate.position.dy);
+    canvas.rotate(plate.angle);
+
+    final path = getPlatePath(plate);
+
+    final layerElevation = 4.0 + plate.layer * 4.0;
+    final shadowPaint = Paint()
+      ..color = const Color(0x38000000).withValues(alpha: (0.24 + plate.layer * 0.05) * plate.opacity)
+      ..maskFilter = MaskFilter.blur(BlurStyle.normal, layerElevation * 1.6);
+
+    final outerRimDark = Paint()
+      ..color = Colors.black.withValues(alpha: 0.25 * plate.opacity)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 6.0
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    final outerGlowWhite = Paint()
+      ..color = Colors.white.withValues(alpha: 0.95 * plate.opacity)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4.0
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    final plateBody = Paint()
+      ..color = plate.color.withValues(alpha: 0.92 * plate.opacity)
+      ..style = PaintingStyle.fill;
+
+    final specularHighlight = Paint()
+      ..color = Colors.white.withValues(alpha: 0.45 * plate.opacity)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.8;
+
+    canvas.drawPath(path.shift(Offset(0, layerElevation)), shadowPaint);
+
+    final is3d = AudioService.I.threeD;
+    if (is3d) {
+      // 3D thickness: stack darker copies of the plate below it
+      final depth = 6.0 + plate.layer * 1.5;
+      final side = Paint()
+        ..color = Color.lerp(plate.color, Colors.black, 0.5)!.withValues(alpha: plate.opacity)
+        ..style = PaintingStyle.fill;
+      for (double d = depth; d >= 1.0; d -= 1.5) {
+        canvas.drawPath(path.shift(Offset(0, d)), side);
+      }
+    }
+    canvas.drawPath(path, outerRimDark);
+    canvas.drawPath(path, outerGlowWhite);
+    canvas.drawPath(path, plateBody);
+    if (is3d) {
+      final b = path.getBounds();
+      canvas.drawPath(
+        path,
+        Paint()
+          ..shader = LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Colors.white.withValues(alpha: 0.38 * plate.opacity),
+              Colors.white.withValues(alpha: 0.0),
+              Colors.black.withValues(alpha: 0.22 * plate.opacity),
+            ],
+            stops: const [0.0, 0.5, 1.0],
+          ).createShader(b),
+      );
+    }
+    canvas.drawPath(path, specularHighlight);
+
+    if (plate.shapeType == PlateShapeType.iceCreamCone) {
+      _renderConeDetails(canvas, plate);
+    } else if (plate.shapeType == PlateShapeType.iceCreamScoopLeft ||
+        plate.shapeType == PlateShapeType.iceCreamScoopRight) {
+      _renderDripDetails(canvas, plate);
+    } else if (plate.shapeType == PlateShapeType.donut) {
+      _renderDonutHole(canvas, plate);
+    }
+
+    for (final hole in plate.holes) {
+      _renderHoleAndScrew(canvas, plate, hole);
+    }
+
+    canvas.restore();
+  }
+
+  void _renderConeDetails(Canvas canvas, PlateModel plate) {
+    final w = plate.size.width;
+    final h = plate.size.height;
+    final bandPaint = Paint()
+      ..color = const Color(0xFFFFD54F).withValues(alpha: 0.85 * plate.opacity)
+      ..style = PaintingStyle.fill;
+
+    final bandRect = RRect.fromRectAndRadius(
+      Rect.fromCenter(center: Offset(0, -h * 0.28), width: w * 0.95, height: 30),
+      const Radius.circular(8),
+    );
+    canvas.drawRRect(bandRect, bandPaint);
+
+    final linePaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.6 * plate.opacity)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+
+    canvas.drawLine(
+      Offset(-w * 0.45, -h * 0.28),
+      Offset(w * 0.45, -h * 0.28),
+      linePaint,
+    );
+  }
+
+  void _renderDripDetails(Canvas canvas, PlateModel plate) {
+    final w = plate.size.width;
+    final h = plate.size.height;
+    final dripPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.50 * plate.opacity)
+      ..style = PaintingStyle.fill;
+
+    final dripPath = Path()
+      ..moveTo(-w * 0.38, -h * 0.05)
+      ..quadraticBezierTo(-w * 0.2, h * 0.35, 0, -h * 0.05)
+      ..quadraticBezierTo(w * 0.2, h * 0.38, w * 0.38, -h * 0.05)
+      ..close();
+
+    canvas.drawPath(dripPath, dripPaint);
+  }
+
+  void _renderDonutHole(Canvas canvas, PlateModel plate) {
+    final centerPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.95 * plate.opacity)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4.0;
+    canvas.drawCircle(Offset.zero, 25, centerPaint);
+  }
+
+  void _renderHoleAndScrew(Canvas canvas, PlateModel plate, ScrewHoleModel hole) {
+    final holePos = hole.relativeOffset;
+
+    final rimPaint = Paint()
+      ..color = const Color(0xFFBDC3C7).withValues(alpha: 0.95 * plate.opacity)
+      ..style = PaintingStyle.fill;
+    final holeInnerPaint = Paint()
+      ..color = const Color(0xFF4A4A4A).withValues(alpha: 0.95 * plate.opacity)
+      ..style = PaintingStyle.fill;
+    final holeDepthPaint = Paint()
+      ..color = const Color(0xFF2C2C2C).withValues(alpha: plate.opacity)
+      ..style = PaintingStyle.fill;
+
+    canvas.drawCircle(holePos, 17, rimPaint);
+    canvas.drawCircle(holePos, 14, holeInnerPaint);
+    canvas.drawCircle(holePos + const Offset(0, 1.5), 11, holeDepthPaint);
+
+    if (hole.currentScrew != null && !_animatingHoleIds.contains(hole.id)) {
+      final screw = hole.currentScrew!;
+
+      final screwShadowPaint = Paint()
+        ..color = screw.shadow.withValues(alpha: 0.38 * plate.opacity)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 5);
+      canvas.drawCircle(holePos + const Offset(0, 3.5), 16, screwShadowPaint);
+
+      final screwBodyPaint = Paint()
+        ..shader = RadialGradient(
+          center: const Alignment(-0.35, -0.4),
+          radius: 0.85,
+          colors: [
+            screw.highlight.withValues(alpha: plate.opacity),
+            screw.primary.withValues(alpha: plate.opacity),
+            screw.dark.withValues(alpha: plate.opacity),
+          ],
+          stops: const [0.0, 0.55, 1.0],
+        ).createShader(Rect.fromCircle(center: holePos, radius: 15.5));
+
+      if (AudioService.I.threeD) {
+        canvas.drawCircle(
+          holePos + const Offset(0, 3.5),
+          15.5,
+          Paint()..color = screw.dark.withValues(alpha: plate.opacity),
+        );
+      }
+      canvas.drawCircle(holePos, 15.5, screwBodyPaint);
+      if (AudioService.I.threeD) {
+        canvas.drawCircle(
+          holePos + const Offset(-5, -6),
+          3.6,
+          Paint()
+            ..color = Colors.white.withValues(alpha: 0.75 * plate.opacity)
+            ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 1.6),
+        );
+      }
+
+      final borderScrew = Paint()
+        ..color = Colors.white.withValues(alpha: 0.65 * plate.opacity)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.3;
+      canvas.drawCircle(holePos, 15.5, borderScrew);
+
+      if (hole.slotType == ScrewSlotType.star) {
+        _renderStarScrewSlot(canvas, holePos, screw.dark.withValues(alpha: plate.opacity));
+      } else {
+        _renderCrossScrewSlot(canvas, holePos, screw.dark.withValues(alpha: plate.opacity));
+      }
+    }
+  }
+
+  void _renderCrossScrewSlot(Canvas canvas, Offset center, Color slotColor) {
+    final crossPaint = Paint()
+      ..color = slotColor
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeWidth = 3.6;
+
+    final arm = 5.5;
+    canvas.drawLine(
+      Offset(center.dx - arm, center.dy - arm),
+      Offset(center.dx + arm, center.dy + arm),
+      crossPaint,
+    );
+    canvas.drawLine(
+      Offset(center.dx + arm, center.dy - arm),
+      Offset(center.dx - arm, center.dy + arm),
+      crossPaint,
+    );
+  }
+
+  void _renderStarScrewSlot(Canvas canvas, Offset center, Color slotColor) {
+    final starFillPaint = Paint()
+      ..color = slotColor
+      ..style = PaintingStyle.fill;
+
+    final path = Path();
+    const double outerR = 6.5;
+    const double innerR = 3.2;
+    const int points = 5;
+
+    for (int i = 0; i < points * 2; i++) {
+      final isEven = i % 2 == 0;
+      final r = isEven ? outerR : innerR;
+      final angle = (i * pi / points) - (pi / 2);
+      final x = center.dx + r * cos(angle);
+      final y = center.dy + r * sin(angle);
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    path.close();
+    canvas.drawPath(path, starFillPaint);
+  }
+
+  @override
+  void onTapDown(TapDownEvent event) {
+    final rawTouchPos = event.localPosition.toOffset();
+    final touchPos = screenToBoard(rawTouchPos);
+
+    final candidates = <({PlateModel plate, ScrewHoleModel hole, double distance, int layer, int index})>[];
+
+    for (int i = 0; i < currentState.plates.length; i++) {
+      final plate = currentState.plates[i];
+      if (plate.isFalling) continue;
+
+      for (final hole in plate.holes) {
+        if (hole.currentScrew == null) continue;
+
+        final globalHolePos = notifier.getGlobalHolePosition(plate, hole);
+        final dist = (touchPos - globalHolePos).distance;
+
+        if (dist <= 28.0) {
+          if (!notifier.isHoleCoveredByHigherPlate(plate, hole, currentState.plates)) {
+            candidates.add((
+              plate: plate,
+              hole: hole,
+              distance: dist,
+              layer: plate.layer,
+              index: i,
+            ));
+          }
+        }
+      }
+    }
+
+    if (candidates.isNotEmpty) {
+      candidates.sort((a, b) {
+        final layerCmp = b.layer.compareTo(a.layer);
+        if (layerCmp != 0) return layerCmp;
+        final idxCmp = b.index.compareTo(a.index);
+        if (idxCmp != 0) return idxCmp;
+        return a.distance.compareTo(b.distance);
+      });
+
+      for (final candidate in candidates) {
+        bool coveredByHigherBody = false;
+        for (int i = 0; i < currentState.plates.length; i++) {
+          final plate = currentState.plates[i];
+          if (plate.isFalling) continue;
+
+          final isHigher = plate.layer > candidate.plate.layer ||
+              (plate.layer == candidate.plate.layer && i > candidate.index);
+
+          if (isHigher) {
+            if (notifier.isPointInsidePlate(touchPos, plate)) {
+              coveredByHigherBody = true;
+              break;
+            }
+          }
+        }
+
+        if (!coveredByHigherBody) {
+          if (_animatingHoleIds.contains(candidate.hole.id)) return;
+
+          final screwColor = candidate.hole.currentScrew!;
+          final slotType = candidate.hole.slotType;
+          final startPos = notifier.getGlobalHolePosition(candidate.plate, candidate.hole);
+          Offset targetPos;
+
+          final boxes = [
+            _BoxSlotTracker(
+              targetColor: currentState.activeBox.targetColor,
+              capacity: currentState.activeBox.capacity,
+              count: currentState.activeBox.collected.length,
+            ),
+            for (final b in currentState.pendingBoxes)
+              _BoxSlotTracker(
+                targetColor: b.targetColor,
+                capacity: b.capacity,
+                count: 0,
+              ),
+          ];
+
+          for (final fs in _flyingScrews) {
+            if (!fs.toActiveBox) continue;
+            for (final b in boxes) {
+              if (b.count < b.capacity) {
+                if (b.targetColor == fs.screw) {
+                  b.count++;
+                }
+                break;
+              }
+            }
+          }
+
+          int targetSlot = -1;
+          int? targetCapacity;
+          bool toActiveBox = false;
+
+          for (final b in boxes) {
+            if (b.count < b.capacity) {
+              if (b.targetColor == screwColor) {
+                toActiveBox = true;
+                targetSlot = b.count;
+                targetCapacity = b.capacity;
+              }
+              break;
+            }
+          }
+
+          if (toActiveBox) {
+            final spacing = 169.0 / (targetCapacity! + 1.0);
+            final targetScreenX =
+                size.x / 2.0 + (targetSlot - (targetCapacity - 1) / 2.0) * spacing;
+            final targetScreenY = -95.0;
+            targetPos = screenToBoard(Offset(targetScreenX, targetScreenY));
+          } else {
+            final reservedWaiting = _flyingScrews
+                .where((fs) => !fs.toActiveBox && fs.targetSlot >= 0)
+                .map((fs) => fs.targetSlot)
+                .toSet();
+            int emptyIdx = -1;
+            for (int i = 0; i < currentState.waitingHolesCapacity; i++) {
+              if (currentState.waitingHoles[i] == null && !reservedWaiting.contains(i)) {
+                emptyIdx = i;
+                break;
+              }
+            }
+
+            if (emptyIdx != -1) {
+              targetSlot = emptyIdx;
+              final targetScreenX = size.x / 2.0 +
+                  ((emptyIdx - (currentState.waitingHolesCapacity - 1) / 2.0) * 42.0);
+              final targetScreenY = -32.0;
+              targetPos = screenToBoard(Offset(targetScreenX, targetScreenY));
+            } else {
+              targetSlot = 0;
+              targetPos = startPos;
+            }
+          }
+
+          _animatingHoleIds.add(candidate.hole.id);
+          AudioService.I.sfx(Sfx.unscrew);
+
+          _flyingScrews.add(FlyingScrew(
+            holeId: candidate.hole.id,
+            screw: screwColor,
+            slotType: slotType,
+            startPos: startPos,
+            targetPos: targetPos,
+            toActiveBox: toActiveBox,
+            targetSlot: targetSlot,
+            duration: 0.26,
+            onComplete: () {
+              AudioService.I.sfx(Sfx.drop);
+              notifier.handleScrewTap(
+                candidate.plate,
+                candidate.hole,
+                currentState.plates,
+                toActiveBox,
+                targetSlot,
+              );
+            },
+          ));
+          return;
+        }
+      }
+      return;
+    }
+
+    for (int i = currentState.plates.length - 1; i >= 0; i--) {
+      final plate = currentState.plates[i];
+      if (plate.isFalling) continue;
+      if (notifier.isPointInsidePlate(touchPos, plate)) {
+        return;
+      }
+    }
+  }
+}
